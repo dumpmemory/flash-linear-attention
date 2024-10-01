@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
-
-# Copyright (c) 2024, Songlin Yang
+# Copyright (c) 2024, Songlin Yang, Yu Zhang
 
 from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
-from torch.cuda.amp import custom_bwd, custom_fwd
 
-from fla.ops.utils import chunk_reversed_cumsum_fwd
-from fla.utils import contiguous
+from fla.ops.utils import chunk_global_reversed_cumsum
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous
 
 
 @triton.jit
@@ -105,10 +103,10 @@ def fused_recurrent_rwkv6_bwd_kernel_dq(
     B: tl.constexpr,  # B
     H: tl.constexpr,  # H
     T: tl.constexpr,  # T
-    BK: tl.constexpr,  # BLOCK SIZE along the K dimension
-    BV: tl.constexpr,  # BLOCK SIZE along the V dimension
     K: tl.constexpr,  # K
     V: tl.constexpr,  # V
+    BK: tl.constexpr,  # BLOCK SIZE along the K dimension
+    BV: tl.constexpr,  # BLOCK SIZE along the V dimension
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     REVERSE: tl.constexpr,  # whether to do autoregressive modeling in the reverse direction
 ):
@@ -176,13 +174,13 @@ def fused_recurrent_rwkv6_bwd_kernel_dkv(
     s_v_h,  # stride size: T * V
 
     scale,  # K ** -0.5
-    B,  # B
-    H,  # H
-    T,  # T
-    BK: tl.constexpr,  # BLOCK SIZE along the K dimension
-    BV: tl.constexpr,  # BLOCK SIZE along the V dimension
+    B: tl.constexpr,  # B
+    H: tl.constexpr,  # H
+    T: tl.constexpr,  # T
     K: tl.constexpr,  # K
     V: tl.constexpr,  # V
+    BK: tl.constexpr,  # BLOCK SIZE along the K dimension
+    BV: tl.constexpr,  # BLOCK SIZE along the V dimension
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     REVERSE: tl.constexpr,  # whether to do autoregressive modeling in the reverse direction
 ):
@@ -239,9 +237,8 @@ class FusedRecurrentRWKV6Function(torch.autograd.Function):
 
     @staticmethod
     @contiguous
-    @custom_fwd
+    @autocast_custom_fwd
     def forward(ctx, r, k, v, w, u, scale=None, initial_state=None, output_final_state=False, reverse=False):
-        # alias
         q = r
         B, H, T, K, V = *q.shape, v.shape[-1]
 
@@ -250,10 +247,7 @@ class FusedRecurrentRWKV6Function(torch.autograd.Function):
         num_stages = 1
         num_warps = 1
 
-        if output_final_state:
-            final_state = q.new_empty(B, H, K, V)
-        else:
-            final_state = None
+        final_state = q.new_empty(B, H, K, V) if output_final_state else None
 
         o = q.new_empty(NK, B, H, T, V, dtype=torch.float32)
         grid = (NV, NK, B * H)
@@ -271,20 +265,16 @@ class FusedRecurrentRWKV6Function(torch.autograd.Function):
         )
 
         o = o.sum(0)
-        ctx.save_for_backward(q, k, v, w, u, initial_state, o)
+        ctx.save_for_backward(q, k, v, w, u, initial_state)
         ctx.scale = scale
         ctx.reverse = reverse
-        # we do not need the gradient of the final state from the next chunk
-        # similiar to Trunctated BPTT
-        if final_state is not None:
-            final_state = final_state.detach()
         return o.to(q.dtype), final_state
 
     @staticmethod
     @contiguous
-    @custom_bwd
-    def backward(ctx, do, d_final_state=None):
-        q, k, v, w, u, initial_state, o = ctx.saved_tensors
+    @autocast_custom_bwd
+    def backward(ctx, do, dht=None):
+        q, k, v, w, u, initial_state = ctx.saved_tensors
         B, H, T, K, V = *q.shape, v.shape[-1]
         scale = ctx.scale
 
@@ -302,10 +292,10 @@ class FusedRecurrentRWKV6Function(torch.autograd.Function):
             v.stride(1),
             scale,
             B=B, H=H, T=T, K=K, V=V, BK=BK, BV=BV,
-            num_warps=num_warps,
-            num_stages=num_stages,
             USE_INITIAL_STATE=initial_state is not None,
             REVERSE=ctx.reverse,
+            num_warps=num_warps,
+            num_stages=num_stages
         )
         dq = dq.sum(0).to(q)
         dq_aux = dq_aux.sum(0)
@@ -335,7 +325,7 @@ class FusedRecurrentRWKV6Function(torch.autograd.Function):
 
         dw = (dq_aux * q * scale)[:, :, 1:] - (dk_aux * k)[:, :, 0:-1]
         dw = torch.nn.functional.pad(dw, (0, 0, 0, 1, 0, 0, 0, 0), value=0)
-        dw = chunk_reversed_cumsum_fwd(dw).to(w)
+        dw = chunk_global_reversed_cumsum(dw).to(w)
 
         du = ((do * v).sum(-1)[..., None] * k * q * scale).sum([0, -2]).to(u)
         return dq, dk, dv, dw, du, None, dh0, None, None
@@ -349,8 +339,7 @@ def fused_recurrent_rwkv6(
     u: torch.Tensor,
     scale: float = -1,
     initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
-    causal: bool = True
+    output_final_state: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:

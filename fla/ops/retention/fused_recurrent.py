@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2023, Yu Zhang, Songlin Yang
+# Copyright (c) 2024, Songlin Yang, Yu Zhang
 
 from typing import Tuple
 
@@ -12,17 +12,8 @@ from fla.utils import contiguous
 # on-the-fly computation without materializing hidden statets into HBMs
 
 
-@torch.jit.script
-def normalize_output(q, k, o):
-    k = k.transpose(-2, -1)
-    k = k.cumsum(-1)
-    k = k.transpose(-2, -1)
-    z = (q * k).sum(-1, keepdim=True)
-    return o / (z + 1e-5)
-
-
 @triton.jit
-def fused_recurrent_linear_attn_fwd_kernel(
+def fused_recurrent_retention_fwd_kernel(
     # B: batch_size, H: n_heads, T: seq_len, D: d_head
     q,  # query [B, H, L, D_head_K]
     k,  # key [B, H, L, D_head_V]
@@ -52,6 +43,10 @@ def fused_recurrent_linear_attn_fwd_kernel(
 ):
     # indices
     i_v, i_k, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_h = i_bh % H
+
+    # decay rate given the head index
+    b_b = (1 - tl.math.exp2(-5 - i_h * 1.0))
 
     p_q = q + i_bh * s_qk_h + i_k * BK + tl.arange(0, BK)
     p_k = k + i_bh * s_qk_h + i_k * BK + tl.arange(0, BK)
@@ -75,7 +70,7 @@ def fused_recurrent_linear_attn_fwd_kernel(
         _v = tl.load(p_v, mask=mask_bv, other=0).to(tl.float32)
         _q = tl.load(p_q, mask=mask_bk, other=0).to(tl.float32) * scale
 
-        h += _k[None, :] * _v[:, None]
+        h = b_b * h + _k[None, :] * _v[:, None]
         _o = h * _q[None, :]
         _o = tl.sum(_o, axis=1)
         tl.store(p_o, _o.to(p_o.dtype.element_ty), mask=mask_bv)
@@ -94,7 +89,7 @@ def fused_recurrent_linear_attn_fwd_kernel(
 
 # Similar to Algorithm1 of https://arxiv.org/abs/2006.16236
 @triton.jit
-def fused_recurrent_linear_attn_bwd_kernel(
+def fused_recurrent_retention_bwd_kernel(
     # B: batch_size, H: n_heads, T: seq_len, D: d_head
     # NV: number of split in the V dimension. NK: number of split in the K dimension
     q,  # query [B, H, L, D_head_K]
@@ -128,6 +123,9 @@ def fused_recurrent_linear_attn_bwd_kernel(
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
 ):
     i_v, i_k, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_h = i_bh % H
+
+    b_b = 1 - tl.math.exp2(-5 - i_h * 1.0)
 
     p_q = q + i_bh * s_qk_h + i_k * BK + tl.arange(0, BK)
     p_k = k + i_bh * s_qk_h + i_k * BK + tl.arange(0, BK)
@@ -152,7 +150,7 @@ def fused_recurrent_linear_attn_bwd_kernel(
         _v = tl.load(p_v, mask=mask_bv, other=0).to(tl.float32)
         _do = tl.load(p_do, mask=mask_bv, other=0).to(tl.float32)
 
-        h += _k[:, None] * _v[None, :]
+        h = b_b * h + _k[:, None] * _v[None, :]
         _d_q = h * _do[None, :]
         d_q = tl.sum(_d_q, axis=1) * scale
         tl.store(p_dq, d_q.to(p_dq.dtype.element_ty), mask=mask_bk)
@@ -184,6 +182,7 @@ def fused_recurrent_linear_attn_bwd_kernel(
         d_k = tl.sum(d_h * _v[None, :], axis=1)
         d_v = tl.sum(d_h * _k[:, None], axis=0)
 
+        d_h *= b_b
         tl.store(p_dk, d_k.to(p_dk.dtype.element_ty), mask=mask_bk)
         tl.store(p_dv, d_v.to(p_dv.dtype.element_ty), mask=mask_bv)
 
@@ -195,7 +194,7 @@ def fused_recurrent_linear_attn_bwd_kernel(
         p_dv -= DV
 
 
-class FusedRecurrentLinearAttentionFunction(torch.autograd.Function):
+class FusedRecurrentRetentionFunction(torch.autograd.Function):
 
     @staticmethod
     @contiguous
@@ -217,7 +216,7 @@ class FusedRecurrentLinearAttentionFunction(torch.autograd.Function):
             final_state = None
 
         grid = (NV, NK, batch_size * n_heads)
-        fused_recurrent_linear_attn_fwd_kernel[grid](
+        fused_recurrent_retention_fwd_kernel[grid](
             q, k, v, o, initial_state, final_state,
             q.stride(1), q.stride(2), q.stride(3),
             v.stride(1), v.stride(2), v.stride(3),
@@ -246,12 +245,12 @@ class FusedRecurrentLinearAttentionFunction(torch.autograd.Function):
         num_stages = 1
         num_warps = 1
 
-        dq = q.new_empty(NV, batch_size, n_heads,  seq_len, d_head_qk)
-        dk = q.new_empty(NV, batch_size, n_heads,  seq_len, d_head_qk)
+        dq = q.new_empty(NV, batch_size, n_heads, seq_len, d_head_qk)
+        dk = q.new_empty(NV, batch_size, n_heads, seq_len, d_head_qk)
         dv = q.new_empty(NK, batch_size, n_heads, seq_len, d_head_v)
         grid = (NV, NK, batch_size * n_heads)
 
-        fused_recurrent_linear_attn_bwd_kernel[grid](
+        fused_recurrent_retention_bwd_kernel[grid](
             q, k, v, do, dq, dk, dv, initial_state,
             q.stride(1), q.stride(2), q.stride(3),
             v.stride(1), v.stride(2), v.stride(3),
@@ -267,18 +266,16 @@ class FusedRecurrentLinearAttentionFunction(torch.autograd.Function):
         return dq, dk, dv, None, None
 
 
-def fused_recurrent_linear_attn(
+# fused_recurrent_retention = FusedRecurrentRetentionFunction.apply
+
+def fused_recurrent_retention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
-    normalize: bool = False
+    output_final_state: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if initial_state is not None:
         initial_state = initial_state.detach()
-    o, final_state = FusedRecurrentLinearAttentionFunction.apply(
-        q, k, v, initial_state, output_final_state)
-    if normalize:
-        o = normalize_output(q, k, o)
+    o, final_state = FusedRecurrentRetentionFunction.apply(q, k, v, initial_state, output_final_state)
     return o, final_state

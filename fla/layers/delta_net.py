@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2024, Songlin Yang, Yu Zhang
 
 # Sect4.2 of Linear Transformers Are Secretly Fast Weight Programmers https://arxiv.org/abs/2102.11174
-
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -13,35 +12,28 @@ from einops import rearrange
 from torch.nn import functional as F
 
 from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
+from fla.modules.l2norm import l2_norm_fn
 from fla.ops.delta_rule import (chunk_delta_rule, fused_chunk_delta_rule,
                                 fused_recurrent_delta_rule)
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
 
-
-def simple_norm(x):
-    return (F.normalize(x, dim=-1) * x.shape[-1] ** 0.5).to(x)
-
-
 # @torch.jit.script
+
+
 def elu_p1(x):
     return (F.elu(x, 1., False) + 1.).to(x)
 
-
 # @torch.jit.script
+
+
 def sum_norm(x):
     return (x / x.sum(-1, keepdim=True)).to(x)
 
-
-# @torch.jit.script
-def elu_norm(x):
-    dtype = x.dtype
-    x = F.elu(x, 1., False) + 1.
-    return (x / x.sum(-1, keepdim=True)).to(dtype)
-
-
 # https://github.com/IDSIA/recurrent-fwp/blob/master/algorithmic/layers.py#L86C1-L146C1
+
+
 class DeltaNet(nn.Module):
     def __init__(
         self,
@@ -50,8 +42,8 @@ class DeltaNet(nn.Module):
         expand_k: float = 1.0,
         expand_v: float = 1.0,
         num_heads: int = 4,
-        mode: str = 'fused_chunk',
-        chunk_size: int = 16,
+        mode: str = 'chunk',
+        chunk_size: int = 64,
         use_beta: bool = True,
         use_gate: bool = False,
         use_output_norm: bool = True,
@@ -194,8 +186,8 @@ class DeltaNet(nn.Module):
 
         if self.qk_norm is not None:
             if self.qk_norm == 'l2':
-                k = nn.functional.normalize(k, dim=-1, p=2).to(v)  # auto mixed precision type transfer is annoying.
-                q = nn.functional.normalize(q, dim=-1, p=2).to(v)
+                q = l2_norm_fn(q)
+                k = l2_norm_fn(k)
             elif self.qk_norm == 'sum':
                 q = sum_norm(q).to(v)
                 k = sum_norm(k).to(v)
@@ -206,13 +198,14 @@ class DeltaNet(nn.Module):
             beta = q.new_ones(q.shape[0], q.shape[1], q.shape[2])
         state = past_key_values[self.layer_idx][-1] if use_cache else None
         if mode == 'fused_recurrent':
-            o, recurrent_state = fused_recurrent_delta_rule(q, k, v, beta, state, output_final_state=use_cache)
+            o, recurrent_state = fused_recurrent_delta_rule(
+                q=q, k=k, v=v, beta=beta, initial_state=state, output_final_state=use_cache)
         elif mode == 'fused_chunk':
-            assert self.chunk_size in [16, 32, 64]
-            o, recurrent_state = fused_chunk_delta_rule(q, k, v, beta, self.chunk_size, state, output_final_state=use_cache)
+            o, recurrent_state = fused_chunk_delta_rule(
+                q=q, k=k, v=v, beta=beta, BT=self.chunk_size, initial_state=state, output_final_state=use_cache)
         elif mode == 'chunk':
-            assert self.chunk_size in [16, 32, 64]
-            o, recurrent_state = chunk_delta_rule(q, k, v, beta, self.chunk_size, state, output_final_state=use_cache)
+            o, recurrent_state = chunk_delta_rule(q=q, k=k, v=v, beta=beta, BT=self.chunk_size,
+                                                  initial_state=state, output_final_state=use_cache)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 

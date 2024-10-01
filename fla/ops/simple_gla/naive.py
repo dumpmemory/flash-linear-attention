@@ -4,8 +4,10 @@ import torch
 from einops import rearrange
 
 
-def torch_simple_gla(q, k, v, g, chunk_size=64):
-    q = rearrange(q, 'b h (n c) d -> b h n c d', c=chunk_size) * (q.shape[-1] ** -0.5)
+def torch_simple_gla(q, k, v, g, chunk_size=64, scale=None):
+    if scale is None:
+        scale = (q.shape[-1] ** -0.5)
+    q = rearrange(q, 'b h (n c) d -> b h n c d', c=chunk_size) * scale
     k = rearrange(k, 'b h (n c) d -> b h n c d', c=chunk_size)
     v = rearrange(v, 'b h (n c) d -> b h n c d', c=chunk_size)
     g = rearrange(g, 'b h (n c) -> b h n c', c=chunk_size)
@@ -25,18 +27,18 @@ def torch_simple_gla(q, k, v, g, chunk_size=64):
     return rearrange(o, 'b h n c d -> b h (n c) d')
 
 
-def torch_simple_gla_recurrent(q, k, v, g, chunk_size=64):
-    # q = rearrange(q, 'b h (n c) d -> b h n c d', c = chunk_size) * (q.shape[-1] ** -0.5)
-    # k = rearrange(k, 'b h (n c) d -> b h n c d', c = chunk_size)
-    # v = rearrange(v, 'b h (n c) d -> b h n c d', c = chunk_size)
-    # g = rearrange(g, 'b h (n c) -> b h n c', c = chunk_size)
-    # g = g.cumsum(-1)
-    # kv = k.transpose(-1, -2) @ v
-
+def torch_simple_gla_recurrent(q, k, v, g, scale=None, initial_state=None, output_final_state=True):
     B, H, T, DK = q.shape
-    q = q * (DK ** -0.5)
+    original_dtype = q.dtype
+    q, k, v, g = q.float(), k.float(), v.float(), g.float()
+    if scale is None:
+        scale = DK ** -0.5
+    q = q * scale
     _, _, _, DV = v.shape
-    S = torch.zeros(B, H, DK, DV).to(q)
+    if initial_state is None:
+        S = torch.zeros(B, H, DK, DV)
+    else:
+        S = initial_state
     o = torch.zeros(B, H, T, DV).to(q)
     for i in range(T):
         gate = g[:, :, i].exp()
@@ -47,5 +49,6 @@ def torch_simple_gla_recurrent(q, k, v, g, chunk_size=64):
         q_i = q[:, :, i, :]
         o_i = (q_i.unsqueeze(-1) * S).sum(-2)
         o[:, :, i] = o_i
-
-    return o
+    if not output_final_state:
+        S = None
+    return o.to(original_dtype), S

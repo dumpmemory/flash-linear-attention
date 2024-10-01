@@ -4,22 +4,18 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from torch.cuda.amp import custom_bwd, custom_fwd
 
-from fla.utils import contiguous
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous
 
 
 # Inspired by "THE WY REPRESENTATION FOR PRODUCTS OF HOUSEHOLDER MATRICES" https://epubs.siam.org/doi/pdf/10.1137/0908009
-# o: cumprod
-# o2: cumprodsum
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=1),
         triton.Config({}, num_warps=2),
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=16)
     ],
     key=["BT", "BK", "BV"],
 )
@@ -74,7 +70,7 @@ def fwd_prepare_wy_repr_kernel(
         p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, allow_tf32=False)
+        b_u = tl.dot(b_A, b_vb)
         p_u = tl.make_block_ptr(u + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         tl.store(p_u, (b_u).to(p_u.dtype.element_ty), boundary_check=(0, 1))
 
@@ -82,7 +78,7 @@ def fwd_prepare_wy_repr_kernel(
         p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = (b_k * b_beta[:, None]).to(b_k.dtype)
-        b_w = tl.dot(b_A, b_kb, allow_tf32=False)
+        b_w = tl.dot(b_A, b_kb)
         p_w = tl.make_block_ptr(w + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
@@ -92,9 +88,7 @@ def fwd_prepare_wy_repr_kernel(
         triton.Config({}, num_warps=1),
         triton.Config({}, num_warps=2),
         triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=8)
     ],
     key=["BT", "BK", "BV"],
 )
@@ -125,15 +119,55 @@ def fwd_recompute_w_u_kernel(
     b_beta = tl.load(p_beta, boundary_check=(0,))
 
     p_A = tl.make_block_ptr(A + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_A = tl.load(p_A, boundary_check=(0, 1)).to(k.dtype.element_ty)
+    b_A = tl.load(p_A, boundary_check=(0, 1))
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, allow_tf32=False)
+        b_u = tl.dot(b_A.to(b_vb.dtype), b_vb, allow_tf32=False)
         p_u = tl.make_block_ptr(u + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         tl.store(p_u, (b_u).to(p_u.dtype.element_ty), boundary_check=(0, 1))
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_kb = (b_k * b_beta[:, None]).to(b_k.dtype)
+        b_w = tl.dot(b_A.to(b_kb.dtype), b_kb, allow_tf32=False)
+        p_w = tl.make_block_ptr(w + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8)
+    ],
+    key=["BT", "BK"],
+)
+@triton.jit
+def fwd_recompute_w_kernel(
+    k,
+    beta,
+    w,
+    A,
+    s_qk_h,
+    s_qk_t,
+    s_qk_d,
+    T,
+    K,
+    BT: tl.constexpr,
+    BK: tl.constexpr
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+
+    p_beta = tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (i_t * BT,), (BT,), (0,))
+    b_beta = tl.load(p_beta, boundary_check=(0,))
+
+    p_A = tl.make_block_ptr(A + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_A = tl.load(p_A, boundary_check=(0, 1)).to(k.dtype.element_ty)
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -150,8 +184,7 @@ def fwd_recompute_w_u_kernel(
         triton.Config({}, num_warps=2),
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=16)
     ],
     key=["BT", "BK", "BV"],
 )
@@ -174,8 +207,8 @@ def bwd_prepare_wy_repr_kernel(
     BV: tl.constexpr
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    p_A = tl.make_block_ptr(A + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_A = tl.load(p_A, boundary_check=(0, 1)).to(k.dtype.element_ty)
+    p_A = tl.make_block_ptr(A + i_bh * T * BT, (BT, T), (1, BT), (0, i_t * BT), (BT, BT), (0, 1))
+    b_A = tl.load(p_A, boundary_check=(0, 1))
 
     b_dbeta = tl.zeros([BT], dtype=tl.float32)
     b_dA = tl.zeros([BT, BT], dtype=tl.float32)
@@ -189,15 +222,13 @@ def bwd_prepare_wy_repr_kernel(
         b_v_beta = (b_v * b_beta[:, None]).to(b_v.dtype)
         b_du = tl.load(p_du, boundary_check=(0, 1))
         b_dA += tl.dot(b_du, tl.trans(b_v_beta), allow_tf32=False)
-        b_dv_beta = tl.dot(tl.trans(b_A), b_du, allow_tf32=False)
+        b_dv_beta = tl.dot(b_A, b_du, allow_tf32=False)
         b_dv = b_dv_beta * b_beta[:, None]
         b_dbeta += tl.sum(b_dv_beta * b_v, 1)
         # store
         p_dv = tl.make_block_ptr(dv + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
-    tl.debug_barrier()
-    b_A2 = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_dw = tl.make_block_ptr(dw + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -205,29 +236,17 @@ def bwd_prepare_wy_repr_kernel(
         b_k_beta = (b_k * b_beta[:, None]).to(b_k.dtype)
         b_dw = tl.load(p_dw, boundary_check=(0, 1))
         b_dA += tl.dot(b_dw, tl.trans(b_k_beta), allow_tf32=False)
-        b_A2 += tl.dot(b_k_beta, tl.trans(b_k), allow_tf32=False)
-        b_dk_beta = tl.dot(tl.trans(b_A), b_dw, allow_tf32=False)
+        b_dk_beta = tl.dot(b_A, b_dw, allow_tf32=False)
         b_dk = b_dk_beta * b_beta[:, None]
         b_dbeta += tl.sum(b_dk_beta * b_k, 1)
         # store
         p_dk = tl.make_block_ptr(dk + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
-    b_A -= (tl.arange(0, BT)[:, None] == tl.arange(0, BT)[None, :])
-    b_A2 = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], -b_A2, 0)
     b_dA = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], b_dA, 0)
-    tl.debug_barrier()
-
-    for i in range(BT-1, 0, -1):
-        mask = tl.arange(0, BT) == i
-        b_da = tl.sum(tl.where(mask[:, None], b_dA, 0), 0)
-        b_a = tl.sum(tl.where(mask[:, None], b_A2, 0), 0)
-        b_da2 = b_da + tl.sum(b_da[None, :] * b_A, 1)
-        b_dA = tl.where(mask[:, None], b_da2, b_dA)
-        b_dA += b_da[None, :] * b_a[:, None]
-
+    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A, allow_tf32=False)
+    b_dA = tl.dot(b_A, b_dA.to(b_A.dtype), allow_tf32=False)
     b_dA = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], -b_dA, 0).to(k.dtype.element_ty)
-    tl.debug_barrier()
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -279,6 +298,19 @@ def fwd_recompute_w_u(k, v, beta, A, BT):
     return w, u
 
 
+def fwd_recompute_w(k, beta, A, BT):
+    B, H, T, K = k.shape
+    w = torch.empty_like(k)
+    NT = triton.cdiv(T, BT)
+    BK = min(triton.next_power_of_2(K), 64)
+    fwd_recompute_w_kernel[(NT, B*H)](
+        k, beta, w, A,
+        k.stride(1), k.stride(2), k.stride(3),
+        T, K, BT, BK
+    )
+    return w
+
+
 def bwd_prepare_wy_repr(k, v, beta, A, dw, du, BT):
     B, H, T, K, V = *k.shape, v.shape[-1]
 
@@ -287,8 +319,8 @@ def bwd_prepare_wy_repr(k, v, beta, A, dw, du, BT):
     BV = min(triton.next_power_of_2(V), 64)
     NT = triton.cdiv(T, BT)
     dk = torch.empty_like(k)
-    dv = torch.empty_like(v).contiguous()
-    dbeta = torch.zeros_like(beta)
+    dv = torch.empty_like(v)
+    dbeta = torch.empty_like(beta)
 
     bwd_prepare_wy_repr_kernel[(NT, B*H)](
         k, v, beta, A,
@@ -302,18 +334,19 @@ def bwd_prepare_wy_repr(k, v, beta, A, dw, du, BT):
 
 
 class WYRepresentationPrepration(torch.autograd.Function):
+
     @staticmethod
     @contiguous
-    @custom_fwd
-    def forward(ctx, k, v, beta, chunk_size):
+    @autocast_custom_fwd
+    def forward(ctx, k, v, beta, chunk_size=64):
         ctx.BT = chunk_size
-        w, u, A = fwd_prepare_wy_repr(k, v, beta,  ctx.BT)
+        w, u, A = fwd_prepare_wy_repr(k, v, beta, ctx.BT)
         ctx.save_for_backward(k, v, beta, A)
         return w, u
 
     @staticmethod
     @contiguous
-    @custom_bwd
+    @autocast_custom_bwd
     def backward(ctx, dw, du):
         k, v, beta, A = ctx.saved_tensors
         BT = ctx.BT
@@ -356,7 +389,7 @@ def naive(k, v, beta, chunk_size):
 
 
 if __name__ == "__main__":
-    torch.set_default_dtype(torch.float32)
+    torch.set_default_dtype(torch.bfloat16)
     seq_len = 1024
     b = 4
     h = 4
@@ -374,11 +407,9 @@ if __name__ == "__main__":
     if require_grad:
         o1.backward(do, retain_graph=True)
         o2.backward(do2, retain_graph=True)
-
         k_grad2, v_grad2, beta_grad2 = k.grad, v.grad, beta.grad
         k.grad = v.grad = beta.grad = None
-
-    o3, o4 = prepare_wy_repr(k.clone(), v.clone(), beta.clone())
+    o3, o4 = prepare_wy_repr(k.clone(), v.clone(), beta.clone(), 64)
     print((o1-o3).abs().max())
     print((o2-o4).abs().max())
 
